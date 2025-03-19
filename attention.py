@@ -78,8 +78,24 @@ class MultiHeadAttention(nn.Module):
 
     def _get_qkv_states(self,hidden_states,attention_mask,encoder_hidden_states,encoder_attention_mask,past_key_value,position_ids):
         '''获取qkv states,主要是为了下游继承'''
-        pass
-
+        query_states = self.transpose_for_q_scores(self.q(hidden_states))
+        if (encoder_hidden_states is not None) and (past_key_value is not None):
+            key_states,value_states = past_key_value
+            attention_mask = encoder_attention_mask
+        elif encoder_hidden_states is not None:
+            key_states = self.transpose_for_k_scores(self.k(encoder_hidden_states))
+            value_states = self.transpose_for_v_scores(self.v(encoder_hidden_states))
+            attention_mask = encoder_attention_mask
+        elif past_key_value is not None:
+            key_states = self.transpose_for_k_scores(self.k(hidden_states))
+            values_sstates = self.transpose_for_v_scores(self.v(encoder_hidden_states))
+            key_states = torch.cat([past_key_value[0],key_states],dim=2)
+            value_states = torch.cat([past_key_value[1],value_states],dim=2)
+        else:
+            key_states = self.transpose_for_k_scores(self.k(hidden_states))
+            value_states = self.transpose_for_v_scores(self.v(hidden_states))
+        return query_states,key_
+              
     def forward(self,
                 hidden_states:Optional[torch.Tensor]=None,
                 attention_mask:Optional[torch.FloatTensor]=None,
@@ -104,7 +120,7 @@ class MultiHeadAttention(nn.Module):
         #value_states shape:[batch_size,num_attention_heads,value_len,attention_head_size]
 
         #使用logn_attn
-        if self.use_logn_attn:
+        if self.use_long_attn:
             query_states*=((position_ids+1)[:,None,:,None].log()/np.log(self.max_position)).clip(1).to(query_states.dtypes)
 
         #past_key_values
@@ -115,5 +131,11 @@ class MultiHeadAttention(nn.Module):
         if hasattr(self,'num_key_value_heads')and self.num_key_value_heads>1:
             key_states= self.repeat_kv(key_states)
             value_states = self.repeat_kv(values_states)
+
+        # longlora
+        if hasattr(self,'longlora_group_size'):
+            query_states,key_states,value_states,attention_mask= self.longlora_shift(query_states,key_states,value_states,attention_mask)
+
+        
 
         
