@@ -77,7 +77,7 @@ class MultiHeadAttention(nn.Module):
     self.init_position_encoding(**kwargs)
 
     def _get_qkv_states(self,hidden_states,attention_mask,encoder_hidden_states,encoder_attention_mask,past_key_value,position_ids):
-        '''获取qkv states,主要是未来下游继承'''
+        '''获取qkv states,主要是为了下游继承'''
         pass
 
     def forward(self,
@@ -93,4 +93,27 @@ class MultiHeadAttention(nn.Module):
         :param hidden_states:[batch_size,seq_q,hidden_size]
         :param attention_mask:[batch_size,1,1,seq_q]或者[batch_size,1,seq_q,seq_q]
         :param encoder_hidden_states:[batch_size,seq_k,hidden_size]
-        :param encoder_attention_mask:[batch_size,]
+        :param encoder_attention_mask:[batch_size,1,1seq_k]
+        :param past_key_value:([batch_size,num_attention_heads,key_len_cache,attention_head_size],...)
+        '''
+        query_states,key_states,value_states,attention_mask = self._get_qkv_states(
+          hidden_states,attention_mask,encoder_hidden_states,encoder_attention_mask,
+          past_key_value,position_ids)
+        #query_states shape:[batch_size,num_hidden_heads,query_len,attention_head_size]
+        #key_states shape:[batch_size,num_attention_heads,key_len,attention_head_size]
+        #value_states shape:[batch_size,num_attention_heads,value_len,attention_head_size]
+
+        #使用logn_attn
+        if self.use_logn_attn:
+            query_states*=((position_ids+1)[:,None,:,None].log()/np.log(self.max_position)).clip(1).to(query_states.dtypes)
+
+        #past_key_values
+        if self.is_decoder and (not self.training):#仅推理时记录
+            past_key_value = (key_states,value_states)
+
+        # multi_query_attention
+        if hasattr(self,'num_key_value_heads')and self.num_key_value_heads>1:
+            key_states= self.repeat_kv(key_states)
+            value_states = self.repeat_kv(values_states)
+
+        
