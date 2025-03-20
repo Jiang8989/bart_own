@@ -56,7 +56,7 @@ class MultiHeadAttention(nn.Module):
     self.attention_head_size = kwargs.get('attention_head_size',int(hidden_size/num_attention_heads))
     self.attention_key_size = kwargs.get('attention_key_size',self.attention_head_size)
     self.scaling = self.attention_head_size**(-0.5)
-    q_inner_dim = self.attention_key_size*num_attention_heads
+    q_inner_dim = self.attention_key_size*self.num_attention_heads
     k_inner_dim = q_inner_dim
     v_inner_dim = self.attention_head_size*num_attention_heads
 
@@ -94,7 +94,7 @@ class MultiHeadAttention(nn.Module):
         else:
             key_states = self.transpose_for_k_scores(self.k(hidden_states))
             value_states = self.transpose_for_v_scores(self.v(hidden_states))
-        return query_states,key_
+        return query_states,key_states,value_states,attention_mask
               
     def forward(self,
                 hidden_states:Optional[torch.Tensor]=None,
@@ -136,6 +136,45 @@ class MultiHeadAttention(nn.Module):
         if hasattr(self,'longlora_group_size'):
             query_states,key_states,value_states,attention_mask= self.longlora_shift(query_states,key_states,value_states,attention_mask)
 
-        
 
+        #attention多类实现
+        #xfoemers
+        attention_scores = None
+        if(self._attn_implementation == 'xforemers') and self.training:
+            context_layer = xops.memory_efficient_attention(query_states,key_states,value_states,attn_bias=xops.LowerTraingularMask())
+        #SDPA
+        elif self._attn_implementation in {True,'sdpa'}:
+            context_layer = self.flash_attention_forward(query_states,key_states,value_states,attention_mask)  
+        # flash_attn
+        elif self._attn_implementation == 'flash_attn_2':
+            context_layer = self.spda_attention_forward(query_states,key_states,value_states,past_key_value,attention_mask,hidden_states.shape[1])
+        # torch原生实现
+        else:
+            context_layer,attention_scores = self.torch_attention_forward(query_states,key_states,value_states,attention_mask)
+
+        if hasattr(self,'longlora_group_size'):
+      #context_layer:[bsz*(q_len//group_size),num_heads,group_size,head_dim]
+            bsz,q_len= hidden_states.shape[:2]
+            context_layer = context_layer.transpose(1,2).contiguous()
+            context_layer = context_layer.reshape(bsz,q_len,self.num_attention_heads,self.attention_head_size)
+            # shift back
+            context_layer[:,:,self.num_attention_heads//2:]= context_layer[:,:,self.num_attention_heads//2:].roll(self.longlora_group_size//2,dims=1)
+            context_layer = context_layer.reshape(bsz,q_len,self.hidden_size)
+        else:
+            # context_layer shape:[batch_size,num_attention_heads,query_len,attention_head_size]
+            context_layer = context_layer.permute(0,2,1,3).contiguous()
+            new_context_layer_shape = context_layer.size()[:-2]+(context_layer.size()[-2]*context_layer.size()[-1],)
+            context_layer = context_layer.reshape(*new_context_layer_shape).contiguous()
+
+        # 是否返回attention scores
+        outputs = (self.o(context_layer),attention_scores)if self.output_attentions else (self.o(context_layer),)
+        return outputs+(past_key_value,) if self.is_decoder else outputs
+
+    def repeat_kv(self,hidden_states):
+        hidden_states = hidden_states.unsqueeze(2)
+        hidden_states = hidden_states.expand(-1,-1,self.num_attention_heads//self.num_key_value_heads,-1,-1)
+        hidden_states = hidden_states.contiguous().view(hidden_states.shape[:1]+(self.num_attention_heads,)+hidden_states.shape[-2:])
+        return hidden_states
+
+    def longlora_shift(self,query_states,key_states,value_states,attention_mask):
         
