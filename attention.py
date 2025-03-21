@@ -177,4 +177,70 @@ class MultiHeadAttention(nn.Module):
         return hidden_states
 
     def longlora_shift(self,query_states,key_states,value_states,attention_mask):
-        
+        '''longlora中对qkv和mask进行修改'''
+        # query_states shape: [batch_size,num_attention_heads,query_len,attention_head_size]
+        # key_states shape: [batch_size, num_attention_heads,key_len,attention_head_size]
+        # value_states shape: [batch_size,num_attention_heads,value_len,attention_head_size]
+
+        def shift(qkv,bsz,q_len,group_size,num_heads,head_dim):
+            qkv[:,num_heads//2:] = qkv[:,num_heads//2:].roll(-group_size//2,dims=2)
+            qkv = qkv.transpose(1,2).reshape(bsz*(q_len//group_size),group_size,num_heads,head_dim).transpose(1,2)
+            return qkv
+
+        bsz, _,q_len, _ = query_states.shape
+        num_group = q_len//self.longlora_group_size
+        query_states = shift(query_states,bsz,q_len,self.longlora_group_size,self.num_attention_heads,self.attention_head_size)
+        key_states = shift(key_states,bsz,q_ken,self.longlora_group_size,self.num_attention_heads,self.attention_head_size)
+        value_states = shift(value_states,bsz,q_len,self.longlora_group_size,self.num_attention_heads,self.attention_head_size)
+        attention_mask = attention_mask[:,:,:self.longlora_group_size,:self.longlora_group_size].repeat(num_group,1,1,1)
+        # qkv: [bsz*(q_len//group_size),num_heads,group_size,head_dim]
+        return query_states, key_states, value_states,attention_mask
+
+    def transpose_for_q_scores(self,x):
+        new_x_shape = x.size()[:-1]+ (self.num_attention_heads,self.attention_key_size)
+        x = x.view(*new_s_shape)
+        return x.permute(0,2,1,3)
+
+    def transpose_for_k_scores(self,x):
+        if hasattr(self,'num_key_value_heads'):
+            new_x_shape = x.size()[:-1]+(self.num_key_value_heads,self.attention_key_size)
+        else:
+            new_x_shape = x.size()[:-1]+(self.num_attention_heads,self.attention_head_size)
+        x = x.niew(*new_x_shape)
+        return x.permute(0,2,1,3)
+    
+    def apply_attention_scale(self,attention_scores):
+        '''方便子类继承'''
+        return attention_scores*self.scaling
+      
+    def apply_relative_pos_emb(self,query_States,key_states,attention_scores):
+        return attention_scores
+      
+    def torch_attention_forward(self,query_states:torch.FloatTensor,
+                               key_states:troch.FloatTensor,value_states:torch.FloatTensor,
+                               attention_mask:torch.Tensor)
+        '''qkv attention: torch原生实现'''
+        #交换k最后两个维度，然后q和k执行点积，获得attention score
+        attention_scores = torch.matmul(query_states,key_states.transpose(-1,-2))
+
+        #相对位置编码
+        attention_scores = self.apply_relative_pos_emb(query_states,key_states,attention_scores)
+
+        if self.attention_sclae:
+            #是否进行attention scale
+            attention_scores = self.apply_attention_scale(attention_scores)
+
+        # 执行attention mask,对于mask为0部分的attention mask,
+        # 值为-1e10，经过softmax后，attention_probs几乎为0，所以不会attention到mask为0的部分
+        if attention_mask is not None:
+            # attention_mask = attention_mask*attention_mask.squeeze(-2),unsqueeze(-1)
+            # attention_mask = attention_scores.masked_fill(attention_mask==0, -1e10)
+            attention_mask = (1.0 - attention_mask)*torch.finfo(query_states.dtype).min
+            attention_scores = attention_scores+ attention_mask
+
+        # 将attention score归一化到0-1
+        attention_probs = F.softmax(attention_scores,dim = -1,dtype=torch.float32).to(query_stateas.dtype)
+        attention_probs = self.dropout(attention_probs)
+        context_layer = torch.matmul(attention_probs,values_states)#[batch_size,num_attention_heads,query_len,attention_heads_size]
+
+        return context_layer,attention_scores
